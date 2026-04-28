@@ -1,20 +1,21 @@
 """PostgreSQL persistence layer for the Telegram Reminder Bot.
 
-Connection parameters are read exclusively from environment variables:
-    DB_HOST      — default: localhost
-    DB_PORT      — default: 5432
-    DB_NAME      — default: reminders
-    DB_USER      — default: postgres
-    DB_PASSWORD  — required (no default)
+Environment variables (all read at call-time, never at import):
+    DB_HOST     — default: localhost
+    DB_PORT     — default: 5432
+    DB_NAME     — default: reminders
+    DB_USER     — default: postgres
+    DB_PASS     — required (no default)
 
-All public functions open, use, and close their own connection so the
-module is safe to call from any asyncio context without a shared state.
+Every public function opens, uses, and closes its own connection so the
+module is safe to call from asyncio without shared mutable state.
 """
 
 import logging
 import os
 import time
 from contextlib import contextmanager
+from datetime import datetime
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -33,13 +34,13 @@ def _connect() -> psycopg2.extensions.connection:
         port=int(os.environ.get("DB_PORT", 5432)),
         dbname=os.environ.get("DB_NAME", "reminders"),
         user=os.environ.get("DB_USER", "postgres"),
-        password=os.environ["DB_PASSWORD"],
+        password=os.environ["DB_PASS"],
     )
 
 
 @contextmanager
 def _get_conn():
-    """Yield a psycopg2 connection, commit on success, rollback on error."""
+    """Yield a connection; commit on clean exit, rollback + close on error."""
     conn = _connect()
     try:
         yield conn
@@ -52,15 +53,15 @@ def _get_conn():
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Schema bootstrap
 # ---------------------------------------------------------------------------
 
 
 def init_db(retries: int = 6, backoff: float = 2.0) -> None:
-    """Create the reminders table (if absent).
+    """Create all tables if they do not already exist.
 
     Retries with exponential back-off so the bot container can start
-    before PostgreSQL is fully ready (useful outside Docker Compose).
+    concurrently with the postgres container without crashing.
     """
     for attempt in range(1, retries + 1):
         try:
@@ -68,22 +69,37 @@ def init_db(retries: int = 6, backoff: float = 2.0) -> None:
                 with conn.cursor() as cur:
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS reminders (
-                            id            SERIAL  PRIMARY KEY,
-                            chat_id       BIGINT  NOT NULL,
-                            message       TEXT    NOT NULL,
-                            start_date    TEXT    NOT NULL,
-                            interval_days INTEGER NOT NULL,
-                            send_time     TEXT    NOT NULL
+                            id            SERIAL          PRIMARY KEY,
+                            chat_id       BIGINT          NOT NULL,
+                            message       TEXT            NOT NULL,
+                            start_date    TEXT            NOT NULL,
+                            interval_days INTEGER         NOT NULL,
+                            send_time     TEXT            NOT NULL,
+                            last_sent     TIMESTAMPTZ
                         )
                     """)
-            logger.info("Database ready.")
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS user_settings (
+                            chat_id  BIGINT      PRIMARY KEY,
+                            language VARCHAR(5)  NOT NULL DEFAULT 'he'
+                        )
+                    """)
+            logger.info("Database schema ready.")
             return
         except psycopg2.OperationalError as exc:
             if attempt == retries:
                 raise
             wait = backoff ** attempt
-            logger.warning("DB not ready (attempt %d/%d) — retrying in %.0fs: %s", attempt, retries, wait, exc)
+            logger.warning(
+                "DB not ready (attempt %d/%d) — retrying in %.0fs: %s",
+                attempt, retries, wait, exc,
+            )
             time.sleep(wait)
+
+
+# ---------------------------------------------------------------------------
+# Reminders
+# ---------------------------------------------------------------------------
 
 
 def add_reminder(
@@ -93,7 +109,7 @@ def add_reminder(
     interval_days: int,
     send_time: str,
 ) -> int:
-    """Insert a new reminder row and return its generated id."""
+    """Insert a reminder and return the generated id."""
     with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -106,7 +122,7 @@ def add_reminder(
 
 
 def get_reminders_by_chat_id(chat_id: int) -> list[dict]:
-    """Return all reminders that belong to a specific user, ordered by id."""
+    """Return all reminders for one user, ordered by id."""
     with _get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -117,7 +133,7 @@ def get_reminders_by_chat_id(chat_id: int) -> list[dict]:
 
 
 def get_all_reminders() -> list[dict]:
-    """Return every reminder row (called on startup to rebuild the JobQueue)."""
+    """Return every reminder row (used on startup to rebuild the JobQueue)."""
     with _get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT * FROM reminders ORDER BY id")
@@ -125,10 +141,9 @@ def get_all_reminders() -> list[dict]:
 
 
 def delete_reminder(reminder_id: int, chat_id: int) -> bool:
-    """Delete a reminder only when it belongs to chat_id.
+    """Delete a reminder that belongs to chat_id.
 
-    Returns True if a row was actually removed, False when the reminder
-    does not exist or belongs to a different user.
+    Returns True when a row was actually removed.
     """
     with _get_conn() as conn:
         with conn.cursor() as cur:
@@ -137,3 +152,43 @@ def delete_reminder(reminder_id: int, chat_id: int) -> bool:
                 (reminder_id, chat_id),
             )
             return cur.rowcount > 0
+
+
+def update_last_sent(reminder_id: int) -> None:
+    """Stamp the reminder with the current UTC time after a successful delivery."""
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE reminders SET last_sent = NOW() WHERE id = %s",
+                (reminder_id,),
+            )
+
+
+# ---------------------------------------------------------------------------
+# User settings
+# ---------------------------------------------------------------------------
+
+
+def get_user_settings(chat_id: int) -> dict | None:
+    """Return the settings row for chat_id, or None if first-time user."""
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM user_settings WHERE chat_id = %s",
+                (chat_id,),
+            )
+            row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def set_user_language(chat_id: int, language: str) -> None:
+    """Upsert the user's preferred language (ISO 639-1 code)."""
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO user_settings (chat_id, language)
+                   VALUES (%s, %s)
+                   ON CONFLICT (chat_id)
+                   DO UPDATE SET language = EXCLUDED.language""",
+                (chat_id, language),
+            )
