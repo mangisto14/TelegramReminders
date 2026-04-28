@@ -15,12 +15,14 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from datetime import datetime
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
 logger = logging.getLogger(__name__)
+
+# Fields that may be updated via update_reminder_field()
+_EDITABLE_FIELDS = frozenset({"message", "start_date", "interval_days", "send_time"})
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +42,7 @@ def _connect() -> psycopg2.extensions.connection:
 
 @contextmanager
 def _get_conn():
-    """Yield a connection; commit on clean exit, rollback + close on error."""
+    """Yield a connection; commit on success, rollback + close on any error."""
     conn = _connect()
     try:
         yield conn
@@ -53,36 +55,42 @@ def _get_conn():
 
 
 # ---------------------------------------------------------------------------
-# Schema bootstrap
+# Schema bootstrap + migration
 # ---------------------------------------------------------------------------
 
 
 def init_db(retries: int = 6, backoff: float = 2.0) -> None:
-    """Create all tables if they do not already exist.
+    """Create tables and apply safe migrations.
 
-    Retries with exponential back-off so the bot container can start
-    concurrently with the postgres container without crashing.
+    Idempotent — safe to call on every restart.
+    Retries with exponential back-off for concurrent container startup.
     """
     for attempt in range(1, retries + 1):
         try:
             with _get_conn() as conn:
                 with conn.cursor() as cur:
+                    # --- Create tables (new installations) ---
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS reminders (
-                            id            SERIAL          PRIMARY KEY,
-                            chat_id       BIGINT          NOT NULL,
-                            message       TEXT            NOT NULL,
-                            start_date    TEXT            NOT NULL,
-                            interval_days INTEGER         NOT NULL,
-                            send_time     TEXT            NOT NULL,
+                            id            SERIAL      PRIMARY KEY,
+                            chat_id       BIGINT      NOT NULL,
+                            message       TEXT        NOT NULL,
+                            start_date    TEXT        NOT NULL,
+                            interval_days INTEGER     NOT NULL,
+                            send_time     TEXT        NOT NULL,
                             last_sent     TIMESTAMPTZ
                         )
                     """)
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS user_settings (
-                            chat_id  BIGINT      PRIMARY KEY,
-                            language VARCHAR(5)  NOT NULL DEFAULT 'he'
+                            chat_id  BIGINT     PRIMARY KEY,
+                            language VARCHAR(5) NOT NULL DEFAULT 'he'
                         )
+                    """)
+                    # --- Migration: add last_sent if upgrading from v1 ---
+                    cur.execute("""
+                        ALTER TABLE reminders
+                            ADD COLUMN IF NOT EXISTS last_sent TIMESTAMPTZ
                     """)
             logger.info("Database schema ready.")
             return
@@ -98,7 +106,7 @@ def init_db(retries: int = 6, backoff: float = 2.0) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Reminders
+# Reminders — CRUD
 # ---------------------------------------------------------------------------
 
 
@@ -113,12 +121,25 @@ def add_reminder(
     with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO reminders (chat_id, message, start_date, interval_days, send_time)
+                """INSERT INTO reminders
+                       (chat_id, message, start_date, interval_days, send_time)
                    VALUES (%s, %s, %s, %s, %s)
                    RETURNING id""",
                 (chat_id, message, start_date, interval_days, send_time),
             )
             return cur.fetchone()[0]
+
+
+def get_reminder_by_id(reminder_id: int, chat_id: int) -> dict | None:
+    """Return a single reminder row, or None if not found / wrong owner."""
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM reminders WHERE id = %s AND chat_id = %s",
+                (reminder_id, chat_id),
+            )
+            row = cur.fetchone()
+    return dict(row) if row else None
 
 
 def get_reminders_by_chat_id(chat_id: int) -> list[dict]:
@@ -140,11 +161,30 @@ def get_all_reminders() -> list[dict]:
             return [dict(r) for r in cur.fetchall()]
 
 
-def delete_reminder(reminder_id: int, chat_id: int) -> bool:
-    """Delete a reminder that belongs to chat_id.
+def update_reminder_field(
+    reminder_id: int,
+    chat_id: int,
+    field: str,
+    value: object,
+) -> bool:
+    """Update one field of a reminder that belongs to chat_id.
 
-    Returns True when a row was actually removed.
+    Only fields in _EDITABLE_FIELDS are accepted to prevent SQL injection
+    via the column name.  Returns True when a row was actually modified.
     """
+    if field not in _EDITABLE_FIELDS:
+        raise ValueError(f"Field '{field}' is not editable.")
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE reminders SET {field} = %s WHERE id = %s AND chat_id = %s",
+                (value, reminder_id, chat_id),
+            )
+            return cur.rowcount > 0
+
+
+def delete_reminder(reminder_id: int, chat_id: int) -> bool:
+    """Delete a reminder owned by chat_id.  Returns True on success."""
     with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -155,7 +195,7 @@ def delete_reminder(reminder_id: int, chat_id: int) -> bool:
 
 
 def update_last_sent(reminder_id: int) -> None:
-    """Stamp the reminder with the current UTC time after a successful delivery."""
+    """Stamp last_sent = NOW() (UTC) after a successful job delivery."""
     with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -170,7 +210,7 @@ def update_last_sent(reminder_id: int) -> None:
 
 
 def get_user_settings(chat_id: int) -> dict | None:
-    """Return the settings row for chat_id, or None if first-time user."""
+    """Return the settings row for chat_id, or None for first-time users."""
     with _get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
